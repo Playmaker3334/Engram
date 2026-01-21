@@ -360,7 +360,7 @@ class Engram(nn.Module):
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id]).to(input_ids.device)
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
