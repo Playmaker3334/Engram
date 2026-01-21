@@ -1,3 +1,7 @@
+"""
+Correctness testing: Compare original vs optimized Engram outputs
+"""
+
 import logging
 import time
 import sys
@@ -205,7 +209,8 @@ def test_engram_module(layer_id, batch_size, seq_len, device):
     cfg_orig = EngramConfigOriginal()
     backbone_orig = BackBoneConfigOriginal()
     
-    input_ids = create_test_data(batch_size, seq_len, backbone_orig.vocab_size, device)
+    actual_vocab_size = len(engram_orig.hash_mapping.compressed_tokenizer.tokenizer)
+    input_ids = create_test_data(batch_size, seq_len, actual_vocab_size, device)
     hidden_states = create_hidden_states(
         batch_size, seq_len, 
         backbone_orig.hidden_size, 
@@ -273,7 +278,8 @@ def test_transformer_block(layer_id, batch_size, seq_len, device):
     
     backbone_orig = BackBoneConfigOriginal()
     
-    input_ids = create_test_data(batch_size, seq_len, backbone_orig.vocab_size, device)
+    actual_vocab_size = len(block_orig.engram.hash_mapping.compressed_tokenizer.tokenizer) if block_orig.engram else backbone_orig.vocab_size
+    input_ids = create_test_data(batch_size, seq_len, actual_vocab_size, device)
     hidden_states = create_hidden_states(
         batch_size, seq_len,
         backbone_orig.hidden_size,
