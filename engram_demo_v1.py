@@ -113,7 +113,7 @@ class CompressedTokenizer:
         arr = input_ids.cpu().numpy() if isinstance(input_ids, torch.Tensor) else np.asarray(input_ids, dtype=np.int64)
         pos_mask = arr >= 0
         out = arr.copy()
-        valid_ids = arr[pos_mask]
+        valid_ids = arr[pos_mask].astype(np.int64)
         out[pos_mask] = self.lookup_table[valid_ids]
         return out   
     
