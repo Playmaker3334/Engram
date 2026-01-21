@@ -110,7 +110,7 @@ class CompressedTokenizer:
         return lookup, len(new_tokens)
     
     def _compress(self, input_ids):
-        arr = np.asarray(input_ids, dtype=np.int64)
+        arr = input_ids.cpu().numpy() if isinstance(input_ids, torch.Tensor) else np.asarray(input_ids, dtype=np.int64)
         pos_mask = arr >= 0
         out = arr.copy()
         valid_ids = arr[pos_mask]
@@ -420,4 +420,3 @@ if __name__ == '__main__':
 
     print("✅ Forward Complete!")
     print(f"{input_ids.shape=}\n{output.shape=}")
-            
