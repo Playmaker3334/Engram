@@ -114,6 +114,8 @@ class CompressedTokenizer:
         pos_mask = arr >= 0
         out = arr.copy()
         valid_ids = arr[pos_mask].astype(np.int64)
+        # Clip to valid range to prevent index out of bounds
+        valid_ids = np.clip(valid_ids, 0, len(self.lookup_table) - 1)
         out[pos_mask] = self.lookup_table[valid_ids]
         return out   
     
