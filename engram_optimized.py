@@ -1,18 +1,19 @@
 """
 ================================================================================
-[Engram Architecture - Optimized Implementation v2]
+[Engram Architecture - Hybrid Optimized Implementation v3]
 
-Optimizations over v1:
-1. Removed LRU cache (serialization overhead exceeded benefits)
-2. Removed logging from forward pass (moved to initialization only)
-3. Streamlined GPU hashing pipeline
-4. Direct MultiHeadEmbedding without caching layer
+Optimizations:
+1. Hybrid CPU/GPU path selection based on input size
+2. Small batches (< threshold): NumPy path (lower overhead)
+3. Large batches (>= threshold): GPU path (better throughput)
+4. No logging in forward pass
+5. Pre-computed constants and buffers
 
 Compatible with benchmark.py and test_correctness.py
 ================================================================================
 """
 
-from typing import List
+from typing import List, Tuple
 from dataclasses import dataclass, field
 import math
 
@@ -22,6 +23,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex
+
 
 @dataclass
 class EngramConfig:
@@ -34,7 +36,10 @@ class EngramConfig:
     pad_id: int = 2
     seed: int = 0
     kernel_size: int = 4
+    # Threshold for GPU vs CPU path (batch_size * seq_len)
+    gpu_threshold: int = 1024
     
+
 @dataclass
 class BackBoneConfig:
     hidden_size: int = 1024
@@ -42,12 +47,16 @@ class BackBoneConfig:
     vocab_size: int = 129280
     num_layers: int = 30
     
+
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
 
 
 class CompressedTokenizer:
-    """Tokenizer compression via NFKC normalization - reduces vocabulary ~23%"""
+    """
+    Tokenizer compression via NFKC normalization.
+    Reduces vocabulary ~23% by merging semantically equivalent tokens.
+    """
     
     def __init__(self, tokenizer_name_or_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -68,14 +77,13 @@ class CompressedTokenizer:
         ])
         
         self.lookup_table, self.num_new_token = self._build_lookup_table()
-        
-        # Pre-convert to torch tensor for faster GPU transfer
-        self._lookup_tensor = torch.from_numpy(self.lookup_table)
+        self._lookup_tensor = None  # Lazy init for GPU
+        self._lookup_tensor_device = None
     
     def __len__(self) -> int:
         return self.num_new_token
     
-    def _build_lookup_table(self):
+    def _build_lookup_table(self) -> Tuple[np.ndarray, int]:
         old2new = {}
         key2new = {}          
         new_tokens = []
@@ -103,23 +111,29 @@ class CompressedTokenizer:
 
         return lookup, len(new_tokens)
     
+    def compress_cpu(self, input_ids: np.ndarray) -> np.ndarray:
+        """Fast CPU path using NumPy indexing"""
+        clamped = np.clip(input_ids, 0, len(self.lookup_table) - 1)
+        return self.lookup_table[clamped]
+    
     def compress_gpu(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """GPU-accelerated compression using pre-built lookup tensor"""
+        """GPU path with lazy tensor initialization"""
         device = input_ids.device
-        lookup = self._lookup_tensor.to(device)
         
-        # Clamp to valid range
+        # Lazy init / device transfer
+        if self._lookup_tensor is None or self._lookup_tensor_device != device:
+            self._lookup_tensor = torch.from_numpy(self.lookup_table).to(device)
+            self._lookup_tensor_device = device
+        
         clamped = input_ids.clamp(0, len(self.lookup_table) - 1)
-        return lookup[clamped]
+        return self._lookup_tensor[clamped]
     
     def __call__(self, input_ids):
         """CPU fallback for compatibility"""
+        if isinstance(input_ids, torch.Tensor):
+            input_ids = input_ids.cpu().numpy()
         arr = np.asarray(input_ids, dtype=np.int64)
-        pos_mask = arr >= 0
-        out = arr.copy()
-        valid_ids = np.clip(arr[pos_mask], 0, len(self.lookup_table) - 1)
-        out[pos_mask] = self.lookup_table[valid_ids]
-        return out
+        return self.compress_cpu(arr)
 
 
 class ShortConv(nn.Module):
@@ -158,19 +172,13 @@ class ShortConv(nn.Module):
             self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Input:  (B, T, HC_MULT, D)
-        Output: (B, T, HC_MULT, D)
-        """
         B, T, G, C = x.shape
 
-        # Apply per-group normalization
         normed_chunks = [self.norms[i](x[:, :, i, :]) for i in range(G)]
         x_norm = torch.cat(normed_chunks, dim=-1)
         
-        # Conv1d expects (B, C, T)
         x_bct = x_norm.transpose(1, 2)
-        y_bct = self.conv(x_bct)[..., :T]  # Causal: trim to original length
+        y_bct = self.conv(x_bct)[..., :T]
 
         if self.activation:
             y_bct = self.act_fn(y_bct)
@@ -179,7 +187,6 @@ class ShortConv(nn.Module):
 
 
 def find_next_prime(start: int, seen_primes: set) -> int:
-    """Find next prime number not in seen_primes"""
     candidate = start + 1
     while True:
         if isprime(candidate) and candidate not in seen_primes:
@@ -187,12 +194,13 @@ def find_next_prime(start: int, seen_primes: set) -> int:
         candidate += 1
 
 
-class FastNgramHashMapping(nn.Module):
+class HybridNgramHashMapping(nn.Module):
     """
-    GPU-accelerated N-gram hashing module.
+    Hybrid CPU/GPU N-gram hashing module.
     
-    Converts input token IDs to hash indices for embedding lookup.
-    Uses multiplicative-XOR hash with prime modulo for collision resistance.
+    Automatically selects optimal path based on input size:
+    - Small inputs: CPU/NumPy (lower overhead)
+    - Large inputs: GPU (better throughput)
     """
     
     def __init__(
@@ -204,7 +212,8 @@ class FastNgramHashMapping(nn.Module):
         layer_ids: List[int],
         tokenizer_name_or_path: str,
         pad_id: int,
-        seed: int,  
+        seed: int,
+        gpu_threshold: int = 1024,
     ):
         super().__init__()
         
@@ -214,6 +223,7 @@ class FastNgramHashMapping(nn.Module):
         self.n_head_per_ngram = n_head_per_ngram
         self.pad_id = pad_id
         self.layer_ids = layer_ids
+        self.gpu_threshold = gpu_threshold
 
         # Initialize compressed tokenizer
         self.compressed_tokenizer = CompressedTokenizer(tokenizer_name_or_path)
@@ -235,19 +245,21 @@ class FastNgramHashMapping(nn.Module):
             r = g.integers(low=0, high=half_bound, size=(self.max_ngram_size,), dtype=np.int64)
             self.layer_multipliers[layer_id] = r * 2 + 1
 
-        # Calculate prime modulo sizes for each n-gram head
+        # Calculate prime modulo sizes
         self.vocab_size_across_layers = self._calculate_vocab_size_across_layers()
         
-        # Register GPU buffers for multipliers and prime mods
+        # Register GPU buffers
         for layer_id in self.layer_ids:
             mult_tensor = torch.tensor(self.layer_multipliers[layer_id], dtype=torch.long)
             self.register_buffer(f"multipliers_layer_{layer_id}", mult_tensor)
             
             all_primes = [p for ngram_heads in self.vocab_size_across_layers[layer_id] for p in ngram_heads]
             self.register_buffer(f"prime_mods_layer_{layer_id}", torch.tensor(all_primes, dtype=torch.long))
+            
+            # Also store as numpy for CPU path
+            setattr(self, f"_np_primes_layer_{layer_id}", np.array(all_primes, dtype=np.int64))
 
     def _calculate_vocab_size_across_layers(self) -> dict:
-        """Calculate unique prime sizes for each n-gram head across layers"""
         seen_primes = set()
         vocab_size_across_layers = {}
         
@@ -269,41 +281,57 @@ class FastNgramHashMapping(nn.Module):
             
         return vocab_size_across_layers
 
-    def _compute_hashes_gpu(self, input_ids: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """
-        Compute n-gram hashes entirely on GPU.
+    def _hash_cpu(self, input_ids: np.ndarray, layer_id: int) -> np.ndarray:
+        """CPU path: NumPy-based hashing (optimal for small inputs)"""
+        B, T = input_ids.shape
         
-        Args:
-            input_ids: Compressed token IDs [B, T]
-            layer_id: Layer index for layer-specific hashing
+        multipliers = self.layer_multipliers[layer_id]
+        prime_mods = getattr(self, f"_np_primes_layer_{layer_id}")
+        
+        # Build shifted versions
+        shifts = [input_ids]
+        for k in range(1, self.max_ngram_size):
+            padding = np.full((B, k), self.pad_id, dtype=np.int64)
+            shifts.append(np.concatenate([padding, input_ids[:, :-k]], axis=1))
+        
+        # Compute hashes
+        all_hashes = []
+        hash_idx = 0
+        
+        for n in range(2, self.max_ngram_size + 1):
+            mix = shifts[0] * multipliers[0]
+            for k in range(1, n):
+                mix = np.bitwise_xor(mix, shifts[k] * multipliers[k])
             
-        Returns:
-            Hash indices [B, T, num_heads] where num_heads = (max_ngram_size-1) * n_head_per_ngram
-        """
+            for _ in range(self.n_head_per_ngram):
+                all_hashes.append((mix % prime_mods[hash_idx]).astype(np.int64))
+                hash_idx += 1
+        
+        return np.stack(all_hashes, axis=2)
+
+    def _hash_gpu(self, input_ids: torch.Tensor, layer_id: int) -> torch.Tensor:
+        """GPU path: PyTorch-based hashing (optimal for large inputs)"""
         B, T = input_ids.shape
         device = input_ids.device
         
         multipliers = getattr(self, f"multipliers_layer_{layer_id}")
         prime_mods = getattr(self, f"prime_mods_layer_{layer_id}")
         
-        # Pre-compute shifted versions for n-gram construction
-        # shifts[k] = input_ids shifted right by k positions (left-padded with pad_id)
+        # Build shifted versions
         shifts = [input_ids]
         for k in range(1, self.max_ngram_size):
             padding = torch.full((B, k), self.pad_id, dtype=torch.long, device=device)
             shifts.append(torch.cat([padding, input_ids[:, :-k]], dim=1))
         
-        # Compute hashes for each n-gram order and head
+        # Compute hashes
         all_hashes = []
         hash_idx = 0
         
         for n in range(2, self.max_ngram_size + 1):
-            # Multiplicative-XOR hash: mix = t[0]*m[0] XOR t[1]*m[1] XOR ...
             mix = shifts[0] * multipliers[0]
             for k in range(1, n):
                 mix = torch.bitwise_xor(mix, shifts[k] * multipliers[k])
             
-            # Apply prime modulo for each head
             for _ in range(self.n_head_per_ngram):
                 all_hashes.append(mix % prime_mods[hash_idx])
                 hash_idx += 1
@@ -312,7 +340,7 @@ class FastNgramHashMapping(nn.Module):
 
     def hash(self, input_ids: torch.Tensor) -> dict:
         """
-        Main hashing interface.
+        Main hashing interface with automatic path selection.
         
         Args:
             input_ids: Raw token IDs [B, T]
@@ -320,64 +348,63 @@ class FastNgramHashMapping(nn.Module):
         Returns:
             Dictionary mapping layer_id -> hash indices [B, T, num_heads]
         """
-        # Compress vocabulary on GPU
-        compressed = self.compressed_tokenizer.compress_gpu(input_ids)
+        B, T = input_ids.shape
+        input_size = B * T
+        device = input_ids.device
         
-        # Compute hashes for each Engram layer
-        return {
-            layer_id: self._compute_hashes_gpu(compressed, layer_id)
-            for layer_id in self.layer_ids
-        }
+        if input_size < self.gpu_threshold:
+            # CPU path for small inputs
+            input_np = input_ids.cpu().numpy()
+            compressed_np = self.compressed_tokenizer.compress_cpu(input_np)
+            
+            result = {}
+            for layer_id in self.layer_ids:
+                hash_np = self._hash_cpu(compressed_np, layer_id)
+                result[layer_id] = torch.from_numpy(hash_np).to(device)
+            return result
+        else:
+            # GPU path for large inputs
+            compressed = self.compressed_tokenizer.compress_gpu(input_ids)
+            return {
+                layer_id: self._hash_gpu(compressed, layer_id)
+                for layer_id in self.layer_ids
+            }
 
 
 class MultiHeadEmbedding(nn.Module):
-    """
-    Multi-head embedding lookup with concatenated embedding tables.
-    
-    Each head has its own embedding table; indices are offset to index
-    into a single concatenated table for efficiency.
-    """
+    """Multi-head embedding lookup with concatenated tables"""
     
     def __init__(self, list_of_N: List[int], D: int):
         super().__init__()
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
         
-        # Compute offsets for each head's embedding table
         offsets = [0]
         for n in list_of_N[:-1]:
             offsets.append(offsets[-1] + n)
         self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
         
-        # Single concatenated embedding table
         total_N = sum(list_of_N)
         self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            input_ids: Hash indices [B, T, num_heads]
-            
-        Returns:
-            Embeddings [B, T, num_heads, D]
-        """
         return self.embedding(input_ids + self.offsets)
 
 
 class Engram(nn.Module):
     """
-    Engram conditional memory module.
+    Engram conditional memory module with hybrid optimization.
     
     Retrieves static n-gram embeddings and fuses them with dynamic hidden states
-    via context-aware gating, as described in the paper.
+    via context-aware gating.
     """
     
     def __init__(self, layer_id: int):
         super().__init__()
         self.layer_id = layer_id
         
-        # N-gram hash mapping
-        self.hash_mapping = FastNgramHashMapping(
+        # Hybrid hash mapping
+        self.hash_mapping = HybridNgramHashMapping(
             engram_vocab_size=engram_cfg.engram_vocab_size,
             max_ngram_size=engram_cfg.max_ngram_size,
             n_embed_per_ngram=engram_cfg.n_embed_per_ngram,
@@ -386,14 +413,15 @@ class Engram(nn.Module):
             tokenizer_name_or_path=engram_cfg.tokenizer_name_or_path,
             pad_id=engram_cfg.pad_id,
             seed=engram_cfg.seed,
+            gpu_threshold=engram_cfg.gpu_threshold,
         )
         
-        # Multi-head embedding table
+        # Multi-head embedding
         vocab_sizes = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y]
         embed_dim = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram
         self.multi_head_embedding = MultiHeadEmbedding(list_of_N=vocab_sizes, D=embed_dim)
         
-        # Short convolution for local context
+        # Short convolution
         self.short_conv = ShortConv(
             hidden_size=backbone_config.hidden_size,
             kernel_size=engram_cfg.kernel_size,
@@ -401,7 +429,7 @@ class Engram(nn.Module):
             hc_mult=backbone_config.hc_mult,
         )
         
-        # Projection layers
+        # Projections
         engram_hidden_size = (engram_cfg.max_ngram_size - 1) * engram_cfg.n_embed_per_ngram
         self.value_proj = nn.Linear(engram_hidden_size, backbone_config.hidden_size)
         self.key_projs = nn.ModuleList([
@@ -409,7 +437,7 @@ class Engram(nn.Module):
             for _ in range(backbone_config.hc_mult)
         ])
         
-        # Normalization layers for gating
+        # Normalizations
         self.norm1 = nn.ModuleList([
             nn.RMSNorm(backbone_config.hidden_size) 
             for _ in range(backbone_config.hc_mult)
@@ -419,25 +447,24 @@ class Engram(nn.Module):
             for _ in range(backbone_config.hc_mult)
         ])
         
+        # Pre-computed constant
         self._inv_sqrt_d = 1.0 / math.sqrt(backbone_config.hidden_size)
     
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            hidden_states: [B, T, HC_MULT, D] - dynamic hidden states from backbone
-            input_ids: [B, T] - raw token IDs
+            hidden_states: [B, T, HC_MULT, D]
+            input_ids: [B, T]
             
         Returns:
-            output: [B, T, HC_MULT, D] - gated memory contribution
+            output: [B, T, HC_MULT, D]
         """
-        # Hash input_ids to embedding indices
+        # Hash and embed
         hash_result = self.hash_mapping.hash(input_ids)
         hash_indices = hash_result[self.layer_id]
-        
-        # Retrieve and flatten embeddings: [B, T, num_heads, D] -> [B, T, num_heads * D]
         embeddings = self.multi_head_embedding(hash_indices).flatten(start_dim=-2)
         
-        # Context-aware gating for each hyper-connection branch
+        # Context-aware gating
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
@@ -445,17 +472,14 @@ class Engram(nn.Module):
             query = hidden_states[:, :, hc_idx, :]
             normed_query = self.norm2[hc_idx](query)
             
-            # Scaled dot-product -> sqrt(abs) -> sigmoid gating
             gate = (normed_key * normed_query).sum(dim=-1) * self._inv_sqrt_d
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
             gates.append(gate.sigmoid().unsqueeze(-1))
         
-        gates = torch.stack(gates, dim=2)  # [B, T, HC_MULT, 1]
+        gates = torch.stack(gates, dim=2)
         
-        # Apply gating to value projection
+        # Gated value + convolution
         value = gates * self.value_proj(embeddings).unsqueeze(2)
-        
-        # Add short convolution for local context expansion
         return value + self.short_conv(value)
 
 
@@ -464,8 +488,8 @@ class TransformerBlock(nn.Module):
     
     def __init__(self, layer_id: int):
         super().__init__()
-        self.attn = lambda x: x  # Mock attention
-        self.moe = lambda x: x   # Mock MoE
+        self.attn = lambda x: x
+        self.moe = lambda x: x
         self.engram = Engram(layer_id=layer_id) if layer_id in engram_cfg.layer_ids else None
     
     def forward(self, input_ids: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -477,9 +501,12 @@ class TransformerBlock(nn.Module):
 
 
 if __name__ == '__main__':
+    import time
+    
     print("=" * 60)
-    print("Engram Optimized v2 - Demo")
+    print("Engram Hybrid Optimized v3 - Demo")
     print("=" * 60)
+    print(f"GPU threshold: {engram_cfg.gpu_threshold} elements")
     
     # Build model
     LLM = [
@@ -493,10 +520,11 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path, trust_remote_code=True)
     input_ids = tokenizer(text, return_tensors='pt').input_ids
     
-    print(f"Input: {text}")
+    print(f"\nInput: {text}")
     print(f"Tokenized shape: {input_ids.shape}")
+    print(f"Input size: {input_ids.shape[0] * input_ids.shape[1]} -> {'CPU' if input_ids.shape[0] * input_ids.shape[1] < engram_cfg.gpu_threshold else 'GPU'} path")
     
-    # Move to GPU if available
+    # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
@@ -506,8 +534,6 @@ if __name__ == '__main__':
     
     # Forward pass
     print("\nRunning forward pass...")
-    
-    import time
     start = time.time()
     
     for idx, layer in enumerate(LLM):
@@ -524,3 +550,34 @@ if __name__ == '__main__':
     
     print(f"\n Forward pass complete in {elapsed:.2f}ms")
     print(f"Output shape: {output.shape}")
+    
+    # Test both paths explicitly
+    print("\n" + "=" * 60)
+    print("Testing both paths explicitly:")
+    print("=" * 60)
+    
+    engram = LLM[2].engram  # Layer 1 has Engram
+    
+    # Small input (CPU path)
+    small_ids = torch.randint(0, 1000, (2, 64), device=device)
+    small_hidden = torch.randn(2, 64, backbone_config.hc_mult, backbone_config.hidden_size, device=device)
+    
+    start = time.time()
+    for _ in range(10):
+        _ = engram(small_hidden, small_ids)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    small_time = (time.time() - start) * 100
+    print(f"Small input (2x64={2*64}): {small_time:.2f}ms avg -> CPU path")
+    
+    # Large input (GPU path)
+    large_ids = torch.randint(0, 1000, (8, 512), device=device)
+    large_hidden = torch.randn(8, 512, backbone_config.hc_mult, backbone_config.hidden_size, device=device)
+    
+    start = time.time()
+    for _ in range(10):
+        _ = engram(large_hidden, large_ids)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    large_time = (time.time() - start) * 100
+    print(f"Large input (8x512={8*512}): {large_time:.2f}ms avg -> GPU path")
