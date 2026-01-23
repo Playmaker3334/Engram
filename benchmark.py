@@ -1,4 +1,3 @@
-
 import logging
 import time
 import json
@@ -119,7 +118,7 @@ def warmup_model(model, input_ids, hidden_states, warmup_iterations=10):
     model.eval()
     with torch.no_grad():
         for i in range(warmup_iterations):
-            _ = model(hidden_states, input_ids)
+            _ = model(input_ids, hidden_states)
             if i % 5 == 0:
                 logger.debug("Warmup iteration %d/%d", i+1, warmup_iterations)
     
@@ -144,7 +143,7 @@ def benchmark_forward_pass(model, input_ids, hidden_states, iterations=100):
                 torch.cuda.synchronize()
             
             start_time = time.time()
-            _ = model(hidden_states, input_ids)
+            _ = model(input_ids, hidden_states)
             
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
