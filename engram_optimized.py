@@ -1,9 +1,20 @@
+"""
+================================================================================
+[Engram Architecture - Optimized Implementation v2]
+
+Optimizations over v1:
+1. Removed LRU cache (serialization overhead exceeded benefits)
+2. Removed logging from forward pass (moved to initialization only)
+3. Streamlined GPU hashing pipeline
+4. Direct MultiHeadEmbedding without caching layer
+
+Compatible with benchmark.py and test_correctness.py
+================================================================================
+"""
+
 from typing import List
 from dataclasses import dataclass, field
-from collections import OrderedDict
 import math
-import time
-import logging
 
 from sympy import isprime
 import numpy as np
@@ -11,12 +22,6 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(name)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @dataclass
 class EngramConfig:
@@ -29,7 +34,6 @@ class EngramConfig:
     pad_id: int = 2
     seed: int = 0
     kernel_size: int = 4
-    cache_size: int = 10000
     
 @dataclass
 class BackBoneConfig:
@@ -41,10 +45,15 @@ class BackBoneConfig:
 engram_cfg = EngramConfig()
 backbone_config = BackBoneConfig()
 
+
 class CompressedTokenizer:
-    def __init__(self, tokenizer_name_or_path):
-        logger.info("Initializing CompressedTokenizer with tokenizer=%s", tokenizer_name_or_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, trust_remote_code=True)
+    """Tokenizer compression via NFKC normalization - reduces vocabulary ~23%"""
+    
+    def __init__(self, tokenizer_name_or_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path, 
+            trust_remote_code=True
+        )
         
         SENTINEL = "\uE000"
         self.normalizer = normalizers.Sequence([
@@ -58,13 +67,12 @@ class CompressedTokenizer:
             normalizers.Replace(SENTINEL, " "),
         ])
         
-        logger.info("Building vocabulary compression lookup table")
         self.lookup_table, self.num_new_token = self._build_lookup_table()
-        compression_ratio = (1 - self.num_new_token / len(self.tokenizer)) * 100
-        logger.info("Vocabulary compressed: %d -> %d tokens (%.2f%% reduction)", 
-                   len(self.tokenizer), self.num_new_token, compression_ratio)
+        
+        # Pre-convert to torch tensor for faster GPU transfer
+        self._lookup_tensor = torch.from_numpy(self.lookup_table)
     
-    def __len__(self):
+    def __len__(self) -> int:
         return self.num_new_token
     
     def _build_lookup_table(self):
@@ -95,20 +103,28 @@ class CompressedTokenizer:
 
         return lookup, len(new_tokens)
     
-    def _compress(self, input_ids):
+    def compress_gpu(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """GPU-accelerated compression using pre-built lookup tensor"""
+        device = input_ids.device
+        lookup = self._lookup_tensor.to(device)
+        
+        # Clamp to valid range
+        clamped = input_ids.clamp(0, len(self.lookup_table) - 1)
+        return lookup[clamped]
+    
+    def __call__(self, input_ids):
+        """CPU fallback for compatibility"""
         arr = np.asarray(input_ids, dtype=np.int64)
         pos_mask = arr >= 0
         out = arr.copy()
-        valid_ids = arr[pos_mask].astype(np.int64)
-        # Clip to valid range to prevent index out of bounds
-        valid_ids = np.clip(valid_ids, 0, len(self.lookup_table) - 1)
+        valid_ids = np.clip(arr[pos_mask], 0, len(self.lookup_table) - 1)
         out[pos_mask] = self.lookup_table[valid_ids]
-        return out   
-    
-    def __call__(self, input_ids):
-        return self._compress(input_ids)
+        return out
+
 
 class ShortConv(nn.Module):
+    """Depthwise causal convolution with RMSNorm and SiLU activation"""
+    
     def __init__(
         self, 
         hidden_size: int, 
@@ -119,8 +135,6 @@ class ShortConv(nn.Module):
         activation: bool = True,
     ):
         super().__init__()
-        logger.debug("Initializing ShortConv: hidden_size=%d, kernel_size=%d, dilation=%d, hc_mult=%d",
-                    hidden_size, kernel_size, dilation, hc_mult)
         self.hc_mult = hc_mult
         self.activation = activation
         
@@ -144,47 +158,55 @@ class ShortConv(nn.Module):
             self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input:  (B, T, HC_MULT, D)
+        Output: (B, T, HC_MULT, D)
+        """
         B, T, G, C = x.shape
-        assert G == self.hc_mult, f"Input groups {G} != hc_mult {self.hc_mult}"
 
-        normed_chunks = []
-        for i in range(G):
-            chunk = x[:, :, i, :]
-            normed_chunks.append(self.norms[i](chunk))
-        
+        # Apply per-group normalization
+        normed_chunks = [self.norms[i](x[:, :, i, :]) for i in range(G)]
         x_norm = torch.cat(normed_chunks, dim=-1)
+        
+        # Conv1d expects (B, C, T)
         x_bct = x_norm.transpose(1, 2)
-        y_bct = self.conv(x_bct)
-        y_bct = y_bct[..., :T]
+        y_bct = self.conv(x_bct)[..., :T]  # Causal: trim to original length
 
         if self.activation:
             y_bct = self.act_fn(y_bct)
-        y = y_bct.transpose(1, 2).view(B, T, G, C).contiguous()
-        
-        return y
+            
+        return y_bct.transpose(1, 2).view(B, T, G, C).contiguous()
 
-def find_next_prime(start, seen_primes):
+
+def find_next_prime(start: int, seen_primes: set) -> int:
+    """Find next prime number not in seen_primes"""
     candidate = start + 1
     while True:
         if isprime(candidate) and candidate not in seen_primes:
             return candidate
         candidate += 1
 
+
 class FastNgramHashMapping(nn.Module):
-    """GPU-accelerated N-gram hashing"""
+    """
+    GPU-accelerated N-gram hashing module.
+    
+    Converts input token IDs to hash indices for embedding lookup.
+    Uses multiplicative-XOR hash with prime modulo for collision resistance.
+    """
+    
     def __init__(
         self, 
-        engram_vocab_size,
-        max_ngram_size,
-        n_embed_per_ngram,
-        n_head_per_ngram,
-        layer_ids,
-        tokenizer_name_or_path,
-        pad_id,
-        seed,  
+        engram_vocab_size: List[int],
+        max_ngram_size: int,
+        n_embed_per_ngram: int,
+        n_head_per_ngram: int,
+        layer_ids: List[int],
+        tokenizer_name_or_path: str,
+        pad_id: int,
+        seed: int,  
     ):
         super().__init__()
-        logger.info("Initializing FastNgramHashMapping for layers=%s", layer_ids)
         
         self.vocab_size_per_ngram = engram_vocab_size
         self.max_ngram_size = max_ngram_size
@@ -193,14 +215,14 @@ class FastNgramHashMapping(nn.Module):
         self.pad_id = pad_id
         self.layer_ids = layer_ids
 
-        self.compressed_tokenizer = CompressedTokenizer(
-            tokenizer_name_or_path=tokenizer_name_or_path
-        )            
+        # Initialize compressed tokenizer
+        self.compressed_tokenizer = CompressedTokenizer(tokenizer_name_or_path)
         self.tokenizer_vocab_size = len(self.compressed_tokenizer)
+        
         if self.pad_id is not None:
             self.pad_id = int(self.compressed_tokenizer.lookup_table[self.pad_id])
         
-        logger.info("Computing layer-specific multipliers with seed=%d", seed)
+        # Compute layer-specific multipliers
         max_long = np.iinfo(np.int64).max
         M_max = int(max_long // self.tokenizer_vocab_size)
         half_bound = max(1, M_max // 2)
@@ -210,37 +232,22 @@ class FastNgramHashMapping(nn.Module):
         for layer_id in self.layer_ids:
             base_seed = int(seed + PRIME_1 * int(layer_id))
             g = np.random.default_rng(base_seed)
-            r = g.integers(
-                low=0,
-                high=half_bound,
-                size=(self.max_ngram_size,),
-                dtype=np.int64
-            )
-            multipliers = r * 2 + 1
-            self.layer_multipliers[layer_id] = multipliers
-            logger.debug("Layer %d multipliers: %s", layer_id, multipliers[:3])
+            r = g.integers(low=0, high=half_bound, size=(self.max_ngram_size,), dtype=np.int64)
+            self.layer_multipliers[layer_id] = r * 2 + 1
 
-        logger.info("Calculating vocabulary sizes across layers")
-        self.vocab_size_across_layers = self.calculate_vocab_size_across_layers()
+        # Calculate prime modulo sizes for each n-gram head
+        self.vocab_size_across_layers = self._calculate_vocab_size_across_layers()
         
-        logger.info("Converting multipliers and prime mods to GPU tensors")
+        # Register GPU buffers for multipliers and prime mods
         for layer_id in self.layer_ids:
-            mult_tensor = torch.tensor(
-                self.layer_multipliers[layer_id], 
-                dtype=torch.long
-            )
+            mult_tensor = torch.tensor(self.layer_multipliers[layer_id], dtype=torch.long)
             self.register_buffer(f"multipliers_layer_{layer_id}", mult_tensor)
             
-            all_primes = []
-            for ngram_heads in self.vocab_size_across_layers[layer_id]:
-                all_primes.extend(ngram_heads)
-            prime_tensor = torch.tensor(all_primes, dtype=torch.long)
-            self.register_buffer(f"prime_mods_layer_{layer_id}", prime_tensor)
-            
-            logger.info("Layer %d: registered %d prime modulos on GPU", 
-                       layer_id, len(all_primes))
+            all_primes = [p for ngram_heads in self.vocab_size_across_layers[layer_id] for p in ngram_heads]
+            self.register_buffer(f"prime_mods_layer_{layer_id}", torch.tensor(all_primes, dtype=torch.long))
 
-    def calculate_vocab_size_across_layers(self):
+    def _calculate_vocab_size_across_layers(self) -> dict:
+        """Calculate unique prime sizes for each n-gram head across layers"""
         seen_primes = set()
         vocab_size_across_layers = {}
         
@@ -248,16 +255,11 @@ class FastNgramHashMapping(nn.Module):
             all_ngram_vocab_sizes = []
             for ngram in range(2, self.max_ngram_size + 1):
                 current_ngram_heads_sizes = []
-                
                 vocab_size = self.vocab_size_per_ngram[ngram - 2]
-                num_head = self.n_head_per_ngram
                 current_prime_search_start = vocab_size - 1
                 
-                for _ in range(num_head):
-                    found_prime = find_next_prime(
-                        current_prime_search_start, 
-                        seen_primes
-                    )
+                for _ in range(self.n_head_per_ngram):
+                    found_prime = find_next_prime(current_prime_search_start, seen_primes)
                     seen_primes.add(found_prime)
                     current_ngram_heads_sizes.append(found_prime)
                     current_prime_search_start = found_prime
@@ -267,328 +269,258 @@ class FastNgramHashMapping(nn.Module):
             
         return vocab_size_across_layers
 
-    def _get_ngram_hashes_gpu(
-        self,
-        input_ids: torch.Tensor,
-        layer_id: int,
-    ) -> torch.Tensor:
-        """GPU-accelerated hashing using torch operations"""
+    def _compute_hashes_gpu(self, input_ids: torch.Tensor, layer_id: int) -> torch.Tensor:
+        """
+        Compute n-gram hashes entirely on GPU.
+        
+        Args:
+            input_ids: Compressed token IDs [B, T]
+            layer_id: Layer index for layer-specific hashing
+            
+        Returns:
+            Hash indices [B, T, num_heads] where num_heads = (max_ngram_size-1) * n_head_per_ngram
+        """
         B, T = input_ids.shape
         device = input_ids.device
-        
-        logger.debug("Computing GPU hash for layer=%d, batch_size=%d, seq_len=%d", 
-                    layer_id, B, T)
-        
-        start_time = time.time()
         
         multipliers = getattr(self, f"multipliers_layer_{layer_id}")
         prime_mods = getattr(self, f"prime_mods_layer_{layer_id}")
         
-        pad_tensor = torch.full((B, 1), self.pad_id, dtype=torch.long, device=device)
+        # Pre-compute shifted versions for n-gram construction
+        # shifts[k] = input_ids shifted right by k positions (left-padded with pad_id)
+        shifts = [input_ids]
+        for k in range(1, self.max_ngram_size):
+            padding = torch.full((B, k), self.pad_id, dtype=torch.long, device=device)
+            shifts.append(torch.cat([padding, input_ids[:, :-k]], dim=1))
         
-        shifts = []
-        for k in range(self.max_ngram_size):
-            if k == 0:
-                shifts.append(input_ids)
-            else:
-                padding = pad_tensor.expand(B, k)
-                shifted = torch.cat([padding, input_ids[:, :-k]], dim=1)
-                shifts.append(shifted)
-        
+        # Compute hashes for each n-gram order and head
         all_hashes = []
         hash_idx = 0
         
         for n in range(2, self.max_ngram_size + 1):
-            tokens = shifts[:n]
-            
-            mix = tokens[0] * multipliers[0]
+            # Multiplicative-XOR hash: mix = t[0]*m[0] XOR t[1]*m[1] XOR ...
+            mix = shifts[0] * multipliers[0]
             for k in range(1, n):
-                mix = torch.bitwise_xor(mix, tokens[k] * multipliers[k])
+                mix = torch.bitwise_xor(mix, shifts[k] * multipliers[k])
             
-            num_heads = self.n_head_per_ngram
-            
-            for j in range(num_heads):
-                mod_val = prime_mods[hash_idx]
-                head_hash = mix % mod_val
-                all_hashes.append(head_hash)
+            # Apply prime modulo for each head
+            for _ in range(self.n_head_per_ngram):
+                all_hashes.append(mix % prime_mods[hash_idx])
                 hash_idx += 1
         
-        result = torch.stack(all_hashes, dim=2)
-        
-        elapsed_ms = (time.time() - start_time) * 1000
-        logger.debug("GPU hash computation completed in %.2fms", elapsed_ms)
-        
-        return result
+        return torch.stack(all_hashes, dim=2)
 
-    def hash(self, input_ids):
-        """Main hashing interface - converts to compressed IDs then hashes on GPU"""
-        logger.debug("Starting hash pipeline for input_ids shape=%s", input_ids.shape)
+    def hash(self, input_ids: torch.Tensor) -> dict:
+        """
+        Main hashing interface.
         
-        device = input_ids.device
+        Args:
+            input_ids: Raw token IDs [B, T]
+            
+        Returns:
+            Dictionary mapping layer_id -> hash indices [B, T, num_heads]
+        """
+        # Compress vocabulary on GPU
+        compressed = self.compressed_tokenizer.compress_gpu(input_ids)
         
-        logger.debug("Compressing tokenizer vocabulary on CPU")
-        input_ids_cpu = input_ids.cpu().numpy()
-        compressed_ids = self.compressed_tokenizer(input_ids_cpu)
-        
-        compressed_tensor = torch.from_numpy(compressed_ids).to(device)
-        
-        hash_ids_for_all_layers = {}
-        for layer_id in self.layer_ids:
-            hash_ids_for_all_layers[layer_id] = self._get_ngram_hashes_gpu(
-                compressed_tensor, 
-                layer_id=layer_id
-            )
-        
-        logger.debug("Hash pipeline complete for %d layers", len(self.layer_ids))
-        return hash_ids_for_all_layers
-
-class LRUCache:
-    """Simple LRU cache for embedding lookups"""
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.cache = OrderedDict()
-        self.hits = 0
-        self.misses = 0
-        logger.info("Initialized LRU cache with capacity=%d", capacity)
-    
-    def get(self, key):
-        if key in self.cache:
-            self.hits += 1
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        else:
-            self.misses += 1
-            return None
-    
-    def put(self, key, value):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        else:
-            self.cache[key] = value
-            if len(self.cache) > self.capacity:
-                evicted = self.cache.popitem(last=False)
-                logger.debug("Cache full, evicted key with hash=%s", hash(evicted[0]))
-    
-    def get_stats(self):
-        total = self.hits + self.misses
-        hit_rate = (self.hits / total * 100) if total > 0 else 0
+        # Compute hashes for each Engram layer
         return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "total_requests": total,
-            "hit_rate_pct": hit_rate
+            layer_id: self._compute_hashes_gpu(compressed, layer_id)
+            for layer_id in self.layer_ids
         }
-    
-    def reset_stats(self):
-        self.hits = 0
-        self.misses = 0
 
-class CachedMultiHeadEmbedding(nn.Module):
-    """MultiHeadEmbedding with LRU cache"""
-    def __init__(self, list_of_N: List[int], D: int, cache_size: int = 10000):
+
+class MultiHeadEmbedding(nn.Module):
+    """
+    Multi-head embedding lookup with concatenated embedding tables.
+    
+    Each head has its own embedding table; indices are offset to index
+    into a single concatenated table for efficiency.
+    """
+    
+    def __init__(self, list_of_N: List[int], D: int):
         super().__init__()
-        logger.info("Initializing CachedMultiHeadEmbedding with cache_size=%d", cache_size)
-        
         self.num_heads = len(list_of_N)
         self.embedding_dim = D
-        self.cache = LRUCache(cache_size)
         
+        # Compute offsets for each head's embedding table
         offsets = [0]
         for n in list_of_N[:-1]:
             offsets.append(offsets[-1] + n)
-        
         self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
         
+        # Single concatenated embedding table
         total_N = sum(list_of_N)
-        logger.info("Total embedding table size: %d entries x %d dims", total_N, D)
         self.embedding = nn.Embedding(num_embeddings=total_N, embedding_dim=D)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        B, T, num_heads = input_ids.shape
-        
-        cache_key = tuple(input_ids.flatten().tolist())
-        
-        cached_result = self.cache.get(cache_key)
-        if cached_result is not None:
-            logger.debug("Cache hit for batch_size=%d, seq_len=%d", B, T)
-            return cached_result
-        
-        logger.debug("Cache miss, computing embeddings")
-        shifted_input_ids = input_ids + self.offsets
-        output = self.embedding(shifted_input_ids)
-        
-        self.cache.put(cache_key, output)
-        
-        return output
-    
-    def log_cache_stats(self):
-        stats = self.cache.get_stats()
-        logger.info("Cache stats - Hits: %d, Misses: %d, Hit rate: %.2f%%",
-                   stats["hits"], stats["misses"], stats["hit_rate_pct"])
-        return stats
+        """
+        Args:
+            input_ids: Hash indices [B, T, num_heads]
+            
+        Returns:
+            Embeddings [B, T, num_heads, D]
+        """
+        return self.embedding(input_ids + self.offsets)
+
 
 class Engram(nn.Module):
-    def __init__(self, layer_id):
+    """
+    Engram conditional memory module.
+    
+    Retrieves static n-gram embeddings and fuses them with dynamic hidden states
+    via context-aware gating, as described in the paper.
+    """
+    
+    def __init__(self, layer_id: int):
         super().__init__()
-        logger.info("Initializing Engram module for layer_id=%d", layer_id)
-        
         self.layer_id = layer_id
+        
+        # N-gram hash mapping
         self.hash_mapping = FastNgramHashMapping(
             engram_vocab_size=engram_cfg.engram_vocab_size,
-            max_ngram_size = engram_cfg.max_ngram_size,
-            n_embed_per_ngram = engram_cfg.n_embed_per_ngram,
-            n_head_per_ngram = engram_cfg.n_head_per_ngram,
-            layer_ids = engram_cfg.layer_ids,
+            max_ngram_size=engram_cfg.max_ngram_size,
+            n_embed_per_ngram=engram_cfg.n_embed_per_ngram,
+            n_head_per_ngram=engram_cfg.n_head_per_ngram,
+            layer_ids=engram_cfg.layer_ids,
             tokenizer_name_or_path=engram_cfg.tokenizer_name_or_path,
-            pad_id = engram_cfg.pad_id,
-            seed = engram_cfg.seed,
+            pad_id=engram_cfg.pad_id,
+            seed=engram_cfg.seed,
         )
         
-        self.multi_head_embedding = CachedMultiHeadEmbedding(
-            list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y],
-            D = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram,
-            cache_size = engram_cfg.cache_size,
-        )
+        # Multi-head embedding table
+        vocab_sizes = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y]
+        embed_dim = engram_cfg.n_embed_per_ngram // engram_cfg.n_head_per_ngram
+        self.multi_head_embedding = MultiHeadEmbedding(list_of_N=vocab_sizes, D=embed_dim)
         
+        # Short convolution for local context
         self.short_conv = ShortConv(
-            hidden_size = backbone_config.hidden_size,
-            kernel_size = engram_cfg.kernel_size,
-            dilation    = engram_cfg.max_ngram_size,
-            hc_mult     = backbone_config.hc_mult,
+            hidden_size=backbone_config.hidden_size,
+            kernel_size=engram_cfg.kernel_size,
+            dilation=engram_cfg.max_ngram_size,
+            hc_mult=backbone_config.hc_mult,
         )
         
-        engram_hidden_size = (engram_cfg.max_ngram_size-1) * engram_cfg.n_embed_per_ngram
+        # Projection layers
+        engram_hidden_size = (engram_cfg.max_ngram_size - 1) * engram_cfg.n_embed_per_ngram
         self.value_proj = nn.Linear(engram_hidden_size, backbone_config.hidden_size)
-        self.key_projs = nn.ModuleList(
-            [nn.Linear(engram_hidden_size, backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)]
-        )
-        self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
-        self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+        self.key_projs = nn.ModuleList([
+            nn.Linear(engram_hidden_size, backbone_config.hidden_size) 
+            for _ in range(backbone_config.hc_mult)
+        ])
         
-        logger.info("Engram module initialization complete for layer %d", layer_id)
+        # Normalization layers for gating
+        self.norm1 = nn.ModuleList([
+            nn.RMSNorm(backbone_config.hidden_size) 
+            for _ in range(backbone_config.hc_mult)
+        ])
+        self.norm2 = nn.ModuleList([
+            nn.RMSNorm(backbone_config.hidden_size) 
+            for _ in range(backbone_config.hc_mult)
+        ])
+        
+        self._inv_sqrt_d = 1.0 / math.sqrt(backbone_config.hidden_size)
     
-    def forward(self, hidden_states, input_ids):
+    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """
-        hidden_states: [B, L, HC_MULT, D]
-        input_ids: [B, L]
+        Args:
+            hidden_states: [B, T, HC_MULT, D] - dynamic hidden states from backbone
+            input_ids: [B, T] - raw token IDs
+            
+        Returns:
+            output: [B, T, HC_MULT, D] - gated memory contribution
         """
-        logger.debug("Engram forward pass - input_ids shape=%s, hidden_states shape=%s",
-                    input_ids.shape, hidden_states.shape)
-        
-        start_time = time.time()
-        
+        # Hash input_ids to embedding indices
         hash_result = self.hash_mapping.hash(input_ids)
-        hash_input_ids = hash_result[self.layer_id].to(input_ids.device)
+        hash_indices = hash_result[self.layer_id]
         
-        hash_time = (time.time() - start_time) * 1000
-        logger.debug("Hash computation took %.2fms", hash_time)
+        # Retrieve and flatten embeddings: [B, T, num_heads, D] -> [B, T, num_heads * D]
+        embeddings = self.multi_head_embedding(hash_indices).flatten(start_dim=-2)
         
-        embed_start = time.time()
-        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
-        embed_time = (time.time() - embed_start) * 1000
-        logger.debug("Embedding lookup took %.2fms", embed_time)
-        
-        gate_start = time.time()
+        # Context-aware gating for each hyper-connection branch
         gates = []
         for hc_idx in range(backbone_config.hc_mult):
             key = self.key_projs[hc_idx](embeddings)
             normed_key = self.norm1[hc_idx](key)
-            query = hidden_states[:,:,hc_idx,:]
+            query = hidden_states[:, :, hc_idx, :]
             normed_query = self.norm2[hc_idx](query)
-            gate = (normed_key * normed_query).sum(dim=-1) / math.sqrt(backbone_config.hidden_size)
+            
+            # Scaled dot-product -> sqrt(abs) -> sigmoid gating
+            gate = (normed_key * normed_query).sum(dim=-1) * self._inv_sqrt_d
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = gate.sigmoid().unsqueeze(-1)
-            gates.append(gate)
-        gates = torch.stack(gates, dim=2)
-        gate_time = (time.time() - gate_start) * 1000
-        logger.debug("Gating computation took %.2fms", gate_time)
+            gates.append(gate.sigmoid().unsqueeze(-1))
         
+        gates = torch.stack(gates, dim=2)  # [B, T, HC_MULT, 1]
+        
+        # Apply gating to value projection
         value = gates * self.value_proj(embeddings).unsqueeze(2)
-        output = value + self.short_conv(value)
         
-        total_time = (time.time() - start_time) * 1000
-        logger.info("Engram forward pass complete in %.2fms (hash=%.2f, embed=%.2f, gate=%.2f)",
-                   total_time, hash_time, embed_time, gate_time)
-        
-        return output
+        # Add short convolution for local context expansion
+        return value + self.short_conv(value)
+
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id):
-        super().__init__()
-        logger.debug("Initializing TransformerBlock for layer %d", layer_id)
-        self.attn = lambda x: x
-        self.moe = lambda x: x
-        self.engram = None
-        if layer_id in engram_cfg.layer_ids:
-            self.engram = Engram(layer_id=layer_id)
-            logger.info("TransformerBlock %d includes Engram module", layer_id)
+    """Transformer block with optional Engram module"""
     
-    def forward(self, input_ids, hidden_states):
+    def __init__(self, layer_id: int):
+        super().__init__()
+        self.attn = lambda x: x  # Mock attention
+        self.moe = lambda x: x   # Mock MoE
+        self.engram = Engram(layer_id=layer_id) if layer_id in engram_cfg.layer_ids else None
+    
+    def forward(self, input_ids: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.engram is not None:
             hidden_states = self.engram(hidden_states=hidden_states, input_ids=input_ids) + hidden_states
         hidden_states = self.attn(hidden_states) + hidden_states
         hidden_states = self.moe(hidden_states) + hidden_states
         return hidden_states
 
+
 if __name__ == '__main__':
-    logger.info("Starting Engram optimized demo")
+    print("=" * 60)
+    print("Engram Optimized v2 - Demo")
+    print("=" * 60)
     
+    # Build model
     LLM = [
         nn.Embedding(backbone_config.vocab_size, backbone_config.hidden_size),
         *[TransformerBlock(layer_id=layer_id) for layer_id in range(backbone_config.num_layers)],
         nn.Linear(backbone_config.hidden_size, backbone_config.vocab_size)
     ]
     
-    logger.info("Model architecture initialized with %d layers", backbone_config.num_layers)
-
+    # Tokenize input
     text = "Only Alexander the Great could tame the horse Bucephalus."
     tokenizer = AutoTokenizer.from_pretrained(engram_cfg.tokenizer_name_or_path, trust_remote_code=True)
     input_ids = tokenizer(text, return_tensors='pt').input_ids
     
-    logger.info("Input text tokenized: %s", text)
-    logger.info("Input shape: batch_size=%d, seq_len=%d", input_ids.shape[0], input_ids.shape[1])
-
-    B, L = input_ids.shape
+    print(f"Input: {text}")
+    print(f"Tokenized shape: {input_ids.shape}")
     
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        logger.info("Using GPU device: %s", torch.cuda.get_device_name(0))
-        input_ids = input_ids.to(device)
-        for layer in LLM:
-            layer.to(device)
-    else:
-        device = torch.device("cpu")
-        logger.warning("CUDA not available, using CPU")
-
-    logger.info("Starting forward pass through %d layers", len(LLM))
-    forward_start = time.time()
-
+    # Move to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    
+    input_ids = input_ids.to(device)
+    for layer in LLM:
+        layer.to(device)
+    
+    # Forward pass
+    print("\nRunning forward pass...")
+    
+    import time
+    start = time.time()
+    
     for idx, layer in enumerate(LLM):
-        layer_start = time.time()
-        
         if idx == 0:
             hidden_states = LLM[0](input_ids)
             hidden_states = hidden_states.unsqueeze(2).expand(-1, -1, backbone_config.hc_mult, -1)
-            logger.debug("Layer 0 (embedding): output shape=%s", hidden_states.shape)
         elif idx == len(LLM) - 1:
-            hidden_states = hidden_states[:,:,0,:] 
+            hidden_states = hidden_states[:, :, 0, :]
             output = layer(hidden_states)
-            logger.debug("Layer %d (output): output shape=%s", idx, output.shape)
         else:
             hidden_states = layer(input_ids=input_ids, hidden_states=hidden_states)
-            logger.debug("Layer %d: output shape=%s", idx, hidden_states.shape)
-        
-        layer_time = (time.time() - layer_start) * 1000
-        logger.debug("Layer %d forward pass took %.2fms", idx, layer_time)
-
-    forward_time = (time.time() - forward_start) * 1000
-    logger.info("Total forward pass completed in %.2fms", forward_time)
     
-    logger.info("Final output shape: %s", output.shape)
-    logger.info("Input IDs shape: %s", input_ids.shape)
+    elapsed = (time.time() - start) * 1000
     
-    for layer in LLM:
-        if isinstance(layer, TransformerBlock) and layer.engram is not None:
-            stats = layer.engram.multi_head_embedding.log_cache_stats()
-    
-    logger.info("Forward pass complete successfully")
+    print(f"\n Forward pass complete in {elapsed:.2f}ms")
+    print(f"Output shape: {output.shape}")
